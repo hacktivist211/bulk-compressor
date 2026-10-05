@@ -1,0 +1,52 @@
+# Bulk Compressor — Runtime Requirements
+# ========================================
+#
+# Python package requirements:
+#
+# REQUIRED
+Pillow>=10.0
+
+# OPTIONAL
+# pikepdf is used by verify_baaaaackup.py for structural PDF validation.
+# If pikepdf is not installed, the verifier falls back to Ghostscript.
+pikepdf>=9.0
+
+# SYSTEM REQUIREMENTS
+#
+# FFmpeg is required for video/audio processing and verification.
+# The following executables must be available on PATH:
+#   ffmpeg
+#   ffprobe
+#
+# Ghostscript is required for PDF compression and is also used as the
+# fallback PDF verification engine when pikepdf is unavailable.
+#
+# Windows:
+#   gswin64c.exe must be available on PATH.
+#
+# Linux/macOS:
+#   gs must be available on PATH.
+#
+# IMPORTANT:
+# This project does NOT use a Python FFmpeg wrapper. It invokes the
+# ffmpeg/ffprobe executables directly through Python subprocesses.
+#
+# Python:
+#   Python 3.10+ recommended.
+#
+# STANDARD LIBRARY ONLY FOR:
+#   engine_compress.py
+#   restore_files.py
+#   (apart from Pillow + external FFmpeg/Ghostscript functionality)
+#
+# INSTALL PYTHON DEPENDENCIES:
+#
+#   python -m pip install -r requirements.txt
+#
+# OPTIONAL PDF-ONLY MINIMAL INSTALL:
+#
+#   python -m pip install Pillow
+#
+# OPTIONAL FULL INSTALL:
+#
+#   python -m pip install Pillow pikepdf
