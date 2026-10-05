@@ -4,8 +4,10 @@ import json
 import shutil
 import hashlib
 import tempfile
+import argparse
 import subprocess
 import threading
+from collections import defaultdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,8 +26,8 @@ total_saved      = 0
 done_count       = 0
 total_count      = 0
 
-VIDEO_WORKERS    = max(1, min(2, (os.cpu_count() or 2) // 2))
-FAST_WORKERS     = max(4, os.cpu_count() or 4)
+CPU = os.cpu_count() or 4
+CFG = {'gpu': False, 'codec': 'hevc', 'cq': 28, 'preset': 'p5'}
 
 
 def fmt_bytes(n):
@@ -51,7 +53,7 @@ def make_tmp(directory, suffix):
     return Path(path)
 
 
-def calculate_file_hash(path, chunk_size=65536):
+def calculate_file_hash(path, chunk_size=1 << 20):
     hasher = hashlib.sha256()
     try:
         with open(path, 'rb') as f:
@@ -60,6 +62,40 @@ def calculate_file_hash(path, chunk_size=65536):
         return hasher.hexdigest()
     except Exception:
         return None
+
+
+def find_duplicates(files):
+    by_size = defaultdict(list)
+    for f in files:
+        try:
+            size = f.stat().st_size
+        except Exception:
+            size = -1
+        by_size[size].append(f)
+
+    unique = []
+    dupes = []
+    to_hash = []
+    for size, group in by_size.items():
+        if size <= 0 or len(group) == 1:
+            unique.extend(group)
+        else:
+            to_hash.extend(group)
+
+    to_hash.sort()
+    with ThreadPoolExecutor(max_workers=CPU) as pool:
+        hashes = list(pool.map(calculate_file_hash, to_hash))
+
+    seen = {}
+    for f, h in zip(to_hash, hashes):
+        if h is None:
+            unique.append(f)
+        elif h in seen:
+            dupes.append((f, seen[h]))
+        else:
+            seen[h] = f
+            unique.append(f)
+    return unique, dupes
 
 
 def probe_duration(path):
@@ -75,7 +111,50 @@ def probe_duration(path):
         return None
 
 
-def replace_if_smaller(src, tmp_path, label, orig_stat=None):
+def nvenc_available(encoder):
+    try:
+        r = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=320x240:d=0.2',
+             '-c:v', encoder, '-f', 'null', '-'],
+            capture_output=True, text=True, timeout=30
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def run_ffmpeg(cmd, timeout):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "ffmpeg timed out"
+    except Exception as e:
+        return False, str(e)
+    if r.returncode != 0:
+        return False, r.stderr[-400:].strip()
+    return True, None
+
+
+def video_cmd(path, tmp, use_gpu):
+    cmd = ['ffmpeg', '-v', 'error', '-y']
+    if use_gpu:
+        cmd += ['-hwaccel', 'cuda']
+    cmd += ['-i', str(path), '-map', '0:v:0', '-map', '0:a?', '-map_metadata', '0']
+    if use_gpu:
+        enc = 'hevc_nvenc' if CFG['codec'] == 'hevc' else 'h264_nvenc'
+        cmd += ['-c:v', enc, '-preset', CFG['preset'], '-tune', 'hq',
+                '-rc', 'vbr', '-cq', str(CFG['cq']), '-b:v', '0',
+                '-spatial-aq', '1', '-temporal-aq', '1',
+                '-rc-lookahead', '32', '-bf', '3', '-pix_fmt', 'yuv420p']
+        if CFG['codec'] == 'hevc':
+            cmd += ['-tag:v', 'hvc1']
+    else:
+        cmd += ['-c:v', 'libx264', '-crf', '22', '-preset', 'fast', '-threads', '0']
+    cmd += ['-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', str(tmp)]
+    return cmd
+
+
+def replace_if_smaller(src, tmp_path, label, orig_stat=None, out_ext=None):
     global total_saved
     original_size = src.stat().st_size
     new_size = tmp_path.stat().st_size
@@ -88,7 +167,18 @@ def replace_if_smaller(src, tmp_path, label, orig_stat=None):
         try:
             if orig_stat:
                 os.utime(tmp_path, (orig_stat.st_atime, orig_stat.st_mtime))
-            shutil.move(str(tmp_path), str(src))
+            if out_ext and src.suffix.lower() != out_ext:
+                dest = src.with_suffix(out_ext)
+                if dest.exists() and dest != src:
+                    tmp_path.unlink(missing_ok=True)
+                    with _lock:
+                        errors.append((str(src), f"collision: {dest} already exists"))
+                    return False
+                os.replace(str(tmp_path), str(dest))
+                if dest != src:
+                    src.unlink(missing_ok=True)
+            else:
+                os.replace(str(tmp_path), str(src))
             with _lock:
                 total_saved += original_size - new_size
                 compressed_files.append((str(src), original_size - new_size))
@@ -204,26 +294,17 @@ def compress_video(path):
 
     tmp = make_tmp(path.parent, '.mp4')
     try:
-        r = subprocess.run(
-            ['ffmpeg', '-v', 'error', '-y', '-i', str(path),
-             '-map_metadata', '0',
-             '-c:v', 'libx264', '-crf', '22', '-preset', 'fast',
-             '-threads', '0',
-             '-c:a', 'aac', '-b:a', '128k',
-             '-movflags', '+faststart',
-             str(tmp)],
-            capture_output=True, text=True, timeout=3600
-        )
-        if r.returncode != 0:
+        ok, err = False, None
+        if CFG['gpu']:
+            ok, err = run_ffmpeg(video_cmd(path, tmp, True), 7200)
+        if not ok:
+            ok, err = run_ffmpeg(video_cmd(path, tmp, False), 7200)
+        if not ok:
             tmp.unlink(missing_ok=True)
             with _lock:
-                errors.append((str(path), r.stderr[-400:].strip()))
+                errors.append((str(path), err))
             return
-        replace_if_smaller(path, tmp, "video", orig_stat=orig_stat)
-    except subprocess.TimeoutExpired:
-        tmp.unlink(missing_ok=True)
-        with _lock:
-            errors.append((str(path), "ffmpeg timed out (60 min)"))
+        replace_if_smaller(path, tmp, "video", orig_stat=orig_stat, out_ext='.mp4')
     except Exception as e:
         tmp.unlink(missing_ok=True)
         with _lock:
@@ -253,7 +334,7 @@ def compress_audio(path):
 
     try:
         r = subprocess.run(
-            ['ffmpeg', '-v', 'error', '-y', '-i', str(path),
+            ['ffmpeg', '-v', 'error', '-y', '-threads', '1', '-i', str(path),
              '-map', '0:a:0', '-map_metadata', '0', '-vn'] + audio_args +
              ['-movflags', '+faststart', str(tmp)],
             capture_output=True, text=True, timeout=600
@@ -363,19 +444,46 @@ def process_file(path, checkpoint_path):
             pass
 
 
+def safe_size(p):
+    try:
+        return p.stat().st_size
+    except Exception:
+        return 0
+
+
 def main():
     global total_count
 
-    if len(sys.argv) < 2:
-        print("Usage: python engine_compress.py <directory>")
-        sys.exit(1)
+    ap = argparse.ArgumentParser()
+    ap.add_argument('directory')
+    ap.add_argument('--codec', choices=['hevc', 'h264'], default='hevc')
+    ap.add_argument('--cq', type=int, default=None)
+    ap.add_argument('--preset', default='p5')
+    ap.add_argument('--video-workers', type=int, default=2)
+    ap.add_argument('--cpu-video', action='store_true')
+    args = ap.parse_args()
 
-    root = Path(sys.argv[1])
+    root = Path(args.directory)
     if not root.is_dir():
         print(f"Directory not found: {root}")
         sys.exit(1)
 
-    checkpoint_path = Path(sys.argv[0]).parent / 'compress_checkpoint.log'
+    CFG['codec'] = args.codec
+    CFG['cq'] = args.cq if args.cq is not None else (28 if args.codec == 'hevc' else 23)
+    CFG['preset'] = args.preset
+
+    encoder = 'hevc_nvenc' if args.codec == 'hevc' else 'h264_nvenc'
+    if not args.cpu_video and nvenc_available(encoder):
+        CFG['gpu'] = True
+        video_workers = max(1, args.video_workers)
+        fast_workers = max(2, CPU - video_workers - 1)
+        video_mode = f"GPU {encoder} cq={CFG['cq']} preset={CFG['preset']}"
+    else:
+        video_workers = max(1, min(2, CPU // 2))
+        fast_workers = max(4, CPU)
+        video_mode = "CPU libx264 crf=22 (NVENC unavailable or disabled)"
+
+    checkpoint_path = Path(sys.argv[0]).resolve().parent / 'compress_checkpoint.log'
 
     completed = set()
     if checkpoint_path.exists():
@@ -392,26 +500,10 @@ def main():
         if f.is_file() and not f.name.startswith('.') and f.name != 'compress_checkpoint.log'
     ]
 
-    seen_hashes = {}
-    unique_files = []
-    redundant_count = 0
-
-    for f in all_files:
-        f_size = f.stat().st_size
-        if f_size == 0:
-            unique_files.append(f)
-            continue
-        f_hash = calculate_file_hash(f)
-        if f_hash:
-            if f_hash in seen_hashes:
-                redundant_count += 1
-                with _lock:
-                    skipped.append((str(f), f"redundant duplicate of {seen_hashes[f_hash].name}"))
-            else:
-                seen_hashes[f_hash] = f
-                unique_files.append(f)
-        else:
-            unique_files.append(f)
+    unique_files, dupes = find_duplicates(all_files)
+    for f, original in dupes:
+        skipped.append((str(f), f"redundant duplicate of {original.name}"))
+    redundant_count = len(dupes)
 
     pending = [f for f in unique_files if str(f) not in completed]
     total_count = len(pending)
@@ -421,32 +513,25 @@ def main():
     print(f"Redundant copies skipped: {redundant_count}")
     print(f"Already done            : {already_done}")
     print(f"To process              : {total_count}")
-    print(f"Fast workers            : {FAST_WORKERS}  (images / audio / pdf)")
-    print(f"Video workers           : {VIDEO_WORKERS}  (each ffmpeg uses all cores)")
+    print(f"Fast workers (CPU)      : {fast_workers}  (images / audio / pdf)")
+    print(f"Video workers           : {video_workers}  [{video_mode}]")
     print(f"Checkpoint file         : {checkpoint_path}\n")
 
     if total_count == 0:
         print("Nothing left to process.")
         return
 
-    videos  = [f for f in pending if f.suffix.lower() in VIDEO_EXTS]
-    fast    = [f for f in pending if f.suffix.lower() not in VIDEO_EXTS]
+    videos = sorted((f for f in pending if f.suffix.lower() in VIDEO_EXTS), key=safe_size, reverse=True)
+    fast   = sorted((f for f in pending if f.suffix.lower() not in VIDEO_EXTS), key=safe_size, reverse=True)
 
-    video_futures = {}
-    fast_futures  = {}
+    video_pool = ThreadPoolExecutor(max_workers=video_workers)
+    fast_pool  = ThreadPoolExecutor(max_workers=fast_workers)
 
-    video_pool = ThreadPoolExecutor(max_workers=VIDEO_WORKERS)
-    fast_pool  = ThreadPoolExecutor(max_workers=FAST_WORKERS)
-
-    for f in fast:
-        fut = fast_pool.submit(process_file, f, checkpoint_path)
-        fast_futures[fut] = f
-
+    all_futures = {}
     for f in videos:
-        fut = video_pool.submit(process_file, f, checkpoint_path)
-        video_futures[fut] = f
-
-    all_futures = {**fast_futures, **video_futures}
+        all_futures[video_pool.submit(process_file, f, checkpoint_path)] = f
+    for f in fast:
+        all_futures[fast_pool.submit(process_file, f, checkpoint_path)] = f
 
     try:
         for fut in as_completed(all_futures):
