@@ -1,399 +1,326 @@
-import os
-import sys
+import argparse
 import json
+import os
 import shutil
 import subprocess
+import sys
 import threading
-from pathlib import Path
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any
 
-IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif', '.gif'}
-VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.3gp', '.webm', '.flv', '.wmv', '.m4v', '.ts'}
-AUDIO_EXTS = {'.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus', '.wma', '.amr', '.aiff'}
-PDF_EXTS   = {'.pdf'}
+from bc_common import (
+    STORE_DIR, QUARANTINE_DIR,
+    fmt_seconds, which, safe_stat, safe_size, file_key,
+    sniff_type, family_of, sweep_temp_files, scan_files, probe_video,
+    zstd_backend, zstd_check, Manifest, EventLog, same_file_snapshot,
+)
+from term_progress import (
+    ProgressDisplay, run_ffmpeg_progress, run_subprocess, enable_ansi,
+)
 
-_lock                = threading.Lock()
-ok_files             = []
-bad_files            = []
-deleted_short_videos = []
-skipped              = []
-done_count           = 0
-total_count          = 0
+CPU = os.cpu_count() or 4
 
-VIDEO_WORKERS = max(1, min(2, (os.cpu_count() or 2) // 2))
-FAST_WORKERS  = max(4, os.cpu_count() or 4)
-
-
-def fmt_bytes(n):
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if n < 1024:
-            return f"{n:.2f} {unit}"
-        n /= 1024
-    return f"{n:.2f} TB"
-
-
-def tick(name, tag):
-    global done_count
-    with _lock:
-        done_count += 1
-        sys.stdout.write(f"\r[{done_count:>4}/{total_count}] [{tag}] {name[:65]:<65}")
-        sys.stdout.flush()
-
-
-def probe_format(path):
-    r = subprocess.run(
-        ['ffprobe', '-v', 'quiet', '-print_format', 'json',
-         '-show_format', '-show_streams', str(path)],
-        capture_output=True, text=True, timeout=60
-    )
-    if r.returncode != 0:
-        return None, r.stderr[:300].strip()
-    try:
-        return json.loads(r.stdout), None
-    except Exception as e:
-        return None, str(e)
-
-
-def full_decode(path, timeout):
-    r = subprocess.run(
-        ['ffmpeg', '-v', 'error', '-i', str(path), '-f', 'null', '-'],
-        capture_output=True, text=True, timeout=timeout
-    )
-    stderr = r.stderr.strip()
-    if r.returncode != 0:
-        return False, f"decode failed: {stderr[:300]}"
-    if stderr:
-        lines = [l for l in stderr.splitlines()
-                 if not l.startswith('    Last message') and 'deprecated' not in l.lower()]
-        if lines:
-            return False, f"decode warnings/errors: {chr(10).join(lines[:5])}"
-    return True, None
+_lock = threading.Lock()
+results: list[dict[str, Any]] = []
 
 
 def verify_image(path):
+    from PIL import Image
+    with Image.open(str(path)) as im:
+        width, height = im.size
+        if width == 0 or height == 0:
+            raise ValueError("zero dimensions %dx%d" % (width, height))
+        im.load()
+    return "decoded"
+
+
+def verify_video(path, display, fast, stop_event=None):
+    duration, _, codec = probe_video(path)
+    if not codec:
+        raise ValueError("no video stream or ffprobe failed")
+    if fast:
+        return "probed %.1fs" % (duration or 0.0)
+    if which("ffmpeg") is None:
+        raise ValueError("ffmpeg not available")
+    slot = display.claim_slot(path.name) if display else None
     try:
-        from PIL import Image
-    except ImportError:
-        with _lock:
-            skipped.append((path, "Pillow not installed"))
-        tick(path.name, "SKP")
-        return
+        cmd = ["ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"]
+        ok, err = run_ffmpeg_progress(
+            cmd, duration, display, slot, 14400, stop_event=stop_event)
+        if not ok and stop_event is not None and stop_event.is_set():
+            raise InterruptedError("verification interrupted")
+        if not ok:
+            raise ValueError(err or "decode failed")
+        return "decoded %.1fs" % (duration or 0.0)
+    finally:
+        if display and slot is not None:
+            display.release_slot(slot)
 
+
+def verify_audio(path, stop_event=None):
+    if which("ffmpeg") is None:
+        raise ValueError("ffmpeg not available")
     try:
-        with Image.open(path) as img:
-            width, height = img.size
-            mode = img.mode
-            if width == 0 or height == 0:
-                raise ValueError(f"zero dimension: {width}x{height}")
-            img.load()
-
-        with _lock:
-            ok_files.append(path)
-        tick(path.name, "OK ")
-    except Exception as e:
-        with _lock:
-            bad_files.append((path, f"image decode failed: {e}"))
-        tick(path.name, "BAD")
+        r = run_subprocess(
+            ["ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-f", "null", "-"],
+            timeout=7200, stop_event=stop_event)
+    except InterruptedError:
+        raise
+    except subprocess.TimeoutExpired:
+        raise ValueError("decode timed out")
+    if r.returncode != 0:
+        raise ValueError((r.stderr or "decode failed")[-300:].strip())
+    return "decoded"
 
 
-def verify_video(path):
-    data, err = probe_format(path)
-    if data is None:
-        with _lock:
-            bad_files.append((path, f"ffprobe failed: {err}"))
-        tick(path.name, "BAD")
-        return
-
-    fmt = data.get('format', {})
-    streams = data.get('streams', [])
-
-    try:
-        duration = float(fmt.get('duration', 0))
-    except (ValueError, TypeError):
-        duration = 0.0
-
-    if duration == 0.0:
-        for s in streams:
-            try:
-                duration = float(s.get('duration', 0))
-                if duration > 0:
-                    break
-            except (ValueError, TypeError):
-                continue
-
-    if 1.0 <= duration <= 3.0:
-        sz = path.stat().st_size
-        path.unlink()
-        with _lock:
-            deleted_short_videos.append((path, f"{duration:.2f}s", sz))
-        tick(path.name, "DEL")
-        return
-
-    video_streams = [s for s in streams if s.get('codec_type') == 'video']
-    audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
-
-    if not video_streams:
-        with _lock:
-            bad_files.append((path, "no video stream found"))
-        tick(path.name, "BAD")
-        return
-
-    vs = video_streams[0]
-    width  = vs.get('width', 0)
-    height = vs.get('height', 0)
-    if not width or not height:
-        with _lock:
-            bad_files.append((path, f"invalid resolution: {width}x{height}"))
-        tick(path.name, "BAD")
-        return
-
-    timeout = max(120, int(duration * 0.5)) if duration > 0 else 300
-    ok, reason = full_decode(path, timeout)
-    if not ok:
-        with _lock:
-            bad_files.append((path, reason))
-        tick(path.name, "BAD")
-        return
-
-    with _lock:
-        ok_files.append(path)
-    tick(path.name, "OK ")
-
-
-def verify_audio(path):
-    data, err = probe_format(path)
-    if data is None:
-        with _lock:
-            bad_files.append((path, f"ffprobe failed: {err}"))
-        tick(path.name, "BAD")
-        return
-
-    streams = data.get('streams', [])
-    audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
-    if not audio_streams:
-        with _lock:
-            bad_files.append((path, "no audio stream found"))
-        tick(path.name, "BAD")
-        return
-
-    try:
-        duration = float(data.get('format', {}).get('duration', 0))
-    except (ValueError, TypeError):
-        duration = 0.0
-
-    timeout = max(60, int(duration * 0.3)) if duration > 0 else 120
-    ok, reason = full_decode(path, timeout)
-    if not ok:
-        with _lock:
-            bad_files.append((path, reason))
-        tick(path.name, "BAD")
-        return
-
-    with _lock:
-        ok_files.append(path)
-    tick(path.name, "OK ")
-
-
-def verify_pdf(path):
-    pikepdf_ok = False
+def verify_pdf(path, stop_event=None):
     try:
         import pikepdf
-        with pikepdf.open(path) as pdf:
-            page_count = len(pdf.pages)
-            if page_count == 0:
-                raise ValueError("PDF has 0 pages")
-            for page in pdf.pages:
-                _ = page.get('/MediaBox')
-        pikepdf_ok = True
-        with _lock:
-            ok_files.append(path)
-        tick(path.name, "OK ")
-        return
     except ImportError:
-        pass
-    except Exception as e:
-        with _lock:
-            bad_files.append((path, f"PDF corrupt (pikepdf): {e}"))
-        tick(path.name, "BAD")
-        return
-
-    if not pikepdf_ok:
-        try:
-            gs_bin = 'gswin64c' if sys.platform == 'win32' else 'gs'
-            r = subprocess.run(
-                [gs_bin, '-dNOPAUSE', '-dBATCH', '-sDEVICE=nullpage',
-                 '-dQUIET', str(path)],
-                capture_output=True, text=True, timeout=120
-            )
-            if r.returncode != 0:
-                with _lock:
-                    bad_files.append((path, f"PDF render failed (gs): {r.stderr[:200].strip()}"))
-                tick(path.name, "BAD")
-                return
-            with _lock:
-                ok_files.append(path)
-            tick(path.name, "OK ")
-        except FileNotFoundError:
-            with _lock:
-                skipped.append((path, "neither pikepdf nor ghostscript available"))
-            tick(path.name, "SKP")
-        except subprocess.TimeoutExpired:
-            with _lock:
-                bad_files.append((path, "ghostscript timed out rendering PDF"))
-            tick(path.name, "BAD")
-        except Exception as e:
-            with _lock:
-                bad_files.append((path, str(e)))
-            tick(path.name, "BAD")
-
-
-def verify_file(path):
-    if not path.exists():
-        return
-
+        pikepdf = None
+    if pikepdf is not None:
+        with pikepdf.open(str(path)) as pdf:
+            if len(pdf.pages) == 0:
+                raise ValueError("PDF has 0 pages")
+        return "pikepdf ok"
+    gs = "gswin64c" if sys.platform == "win32" else "gs"
+    if which(gs) is None:
+        return "no PDF engine available"
     try:
-        size = path.stat().st_size
-    except Exception:
-        with _lock:
-            bad_files.append((path, "could not stat file"))
-        tick(path.name, "BAD")
-        return
+        r = run_subprocess(
+            [gs, "-dNOPAUSE", "-dBATCH", "-sDEVICE=nullpage", "-dQUIET", str(path)],
+            timeout=1800, stop_event=stop_event)
+    except InterruptedError:
+        raise
+    except subprocess.TimeoutExpired:
+        raise ValueError("ghostscript timed out")
+    if r.returncode != 0:
+        raise ValueError("ghostscript render failed: %s" % (r.stderr or "")[-200:].strip())
+    return "ghostscript ok"
 
-    if size == 0:
-        with _lock:
-            bad_files.append((path, "0-byte file"))
-        tick(path.name, "BAD")
-        return
 
-    ext = path.suffix.lower()
-    if ext in IMAGE_EXTS:
-        verify_image(path)
-    elif ext in VIDEO_EXTS:
-        verify_video(path)
-    elif ext in AUDIO_EXTS:
-        verify_audio(path)
-    elif ext in PDF_EXTS:
-        verify_pdf(path)
+def quarantine_file(root, path):
+    rel = path.relative_to(root)
+    dest = root / QUARANTINE_DIR / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    final = dest
+    n = 1
+    while final.exists() or final.is_symlink():
+        final = dest.with_name("%s_%d%s" % (dest.stem, n, dest.suffix))
+        n += 1
+    shutil.move(str(path), str(final))
+    return final
+
+
+def verify_file(path, ctx):
+    display = ctx["display"]
+    if ctx.get("stop_event") is not None and ctx["stop_event"].is_set():
+        with _lock:
+            results.append({"verdict": "skip", "path": str(path),
+                            "note": "cancelled by user", "quarantined": None})
+        if display:
+            display.advance(0, 0, False, "cancelled  %s" % path.name)
+        return
+    st = safe_stat(path)
+    key = None
+    if st is not None:
+        key = file_key(path, st)
+    if st is None:
+        verdict, note = "fail", "unreadable"
+    elif st.st_size == 0:
+        verdict, note = "fail", "empty file"
     else:
-        with _lock:
-            skipped.append((path, f"type {ext} not verifiable"))
-        tick(path.name, "SKP")
+        kind = ctx["kinds"].get(path) or sniff_type(path)
+        fam = family_of(kind)
+        verdict, note = "skip", "not verifiable (%s)" % kind
+        try:
+            if fam == "image":
+                note = verify_image(path)
+                verdict = "ok"
+            elif fam == "video":
+                note = verify_video(path, display, ctx["fast"], ctx.get("stop_event"))
+                verdict = "ok"
+            elif fam == "audio":
+                note = verify_audio(path, ctx.get("stop_event"))
+                verdict = "ok"
+            elif fam == "pdf":
+                note = verify_pdf(path, ctx.get("stop_event"))
+                verdict = "skip" if note.startswith("no PDF engine") else "ok"
+            elif kind == "zstd":
+                if zstd_backend()[0] is None:
+                    verdict, note = "skip", "zstd backend unavailable"
+                else:
+                    ok, err = zstd_check(path)
+                    verdict = "ok" if ok else "fail"
+                    note = "zstd stream decompressed" if ok else (err or "zstd stream corrupt")
+        except Exception as e:
+            if ctx.get("stop_event") is not None and ctx["stop_event"].is_set():
+                verdict, note = "skip", "cancelled by user"
+            else:
+                verdict, note = "fail", str(e)
+    q_path = None
+    if ctx.get("stop_event") is not None and ctx["stop_event"].is_set():
+        verdict, note = "skip", "cancelled by user"
+    if verdict == "fail" and st is not None and not same_file_snapshot(path, st):
+        verdict, note = "skip", "file changed during verification; not quarantined"
+    if verdict == "fail" and ctx["quarantine"]:
+        q_path = quarantine_file(ctx["root"], path)
+        ctx["manifest"].add_quarantine(str(path), str(q_path), note)
+        ctx["events"].log("quarantined", path=str(path), q_path=str(q_path), reason=note)
+    if key:
+        ctx["manifest"].set_verify(key, verdict == "ok", note)
+    with _lock:
+        results.append({"verdict": verdict, "path": str(path), "note": note,
+                        "quarantined": str(q_path) if q_path else None})
+    ctx["events"].log("verify_" + verdict, path=str(path), note=note)
+    if display:
+        display.advance(st.st_size if st else 0, 0, verdict == "fail",
+                        "%s  %s" % (verdict.upper(), path.name))
 
 
 def main():
-    global total_count
+    ap = argparse.ArgumentParser(
+        description="Non-destructive verification: full decode of images, video, audio and PDFs, "
+                    "zstd stream checks, optional quarantine (never deletion)")
+    ap.add_argument("directory")
+    ap.add_argument("--fast", action="store_true",
+                    help="structural probe only, skip full decode")
+    ap.add_argument("--quarantine", action="store_true",
+                    help="move failing files into _Quarantine/ preserving their directory tree; "
+                         "recorded in the manifest, restore with restore_files.py")
+    ap.add_argument("--video-workers", type=int, default=2)
+    ap.add_argument("--workers", type=int, default=None)
+    ap.add_argument("--no-progress", action="store_true")
+    args = ap.parse_args()
+    if args.video_workers < 1:
+        ap.error("--video-workers must be at least 1")
+    if args.workers is not None and args.workers < 1:
+        ap.error("--workers must be at least 1")
 
-    if len(sys.argv) < 2:
-        print("Usage: python verify_backup.py <directory>")
-        sys.exit(1)
-
-    root = Path(sys.argv[1]).resolve()
+    enable_ansi()
+    root = Path(args.directory).resolve()
     if not root.is_dir():
-        print(f"Directory not found: {root}")
+        print("Directory not found: %s" % root, file=sys.stderr)
         sys.exit(1)
 
-    corrupt_dir = root / "_Corrupted_Files"
+    manifest = Manifest(root)
+    events = EventLog(root)
+    started = time.time()
+    events.log("run_start", kind="verify", fast=args.fast, quarantine=args.quarantine)
+    removed = sweep_temp_files(root)
+    if removed:
+        print("swept %d leftover temporary files" % removed)
 
-    all_files = [
-        f for f in sorted(root.rglob('*'))
-        if f.is_file() and not f.name.startswith('.') and corrupt_dir not in f.parents
-    ]
+    files, symlinks = scan_files(root)
+    kinds = {}
+    for f in files:
+        kinds[f] = sniff_type(f)
 
-    total_count = len(all_files)
-    videos = [f for f in all_files if f.suffix.lower() in VIDEO_EXTS]
-    fast   = [f for f in all_files if f.suffix.lower() not in VIDEO_EXTS]
+    video_workers = max(1, args.video_workers)
+    fast_workers = args.workers or max(2, CPU - video_workers)
 
-    print(f"\nVerifying: {root}")
-    print(f"Total files : {total_count}")
-    print(f"Fast workers: {FAST_WORKERS}  |  Video workers: {VIDEO_WORKERS}")
-    print(f"[OK ] = fully decodable  [BAD] = corrupt/unplayable  [DEL] = short video removed  [SKP] = skipped\n")
-
-    fast_pool  = ThreadPoolExecutor(max_workers=FAST_WORKERS)
-    video_pool = ThreadPoolExecutor(max_workers=VIDEO_WORKERS)
-
-    all_futures = {}
-    for f in fast:
-        all_futures[fast_pool.submit(verify_file, f)] = f
-    for f in videos:
-        all_futures[video_pool.submit(verify_file, f)] = f
-
-    try:
-        for fut in as_completed(all_futures):
-            exc = fut.exception()
-            if exc:
-                with _lock:
-                    bad_files.append((all_futures[fut], f"unhandled: {exc}"))
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        fast_pool.shutdown(wait=False, cancel_futures=True)
-        video_pool.shutdown(wait=False, cancel_futures=True)
-    else:
-        fast_pool.shutdown(wait=True)
-        video_pool.shutdown(wait=True)
-
-    print("\n")
-    print("=" * 80)
-    print("VERIFICATION COMPLETE")
-    print("=" * 80)
-    print(f"  Total files           : {total_count}")
-    print(f"  Passed (fully decoded): {len(ok_files)}")
-    print(f"  Failed (bad/corrupt)  : {len(bad_files)}")
-    print(f"  Deleted (1-3s videos) : {len(deleted_short_videos)}")
-    print(f"  Skipped (no engine)   : {len(skipped)}")
-    print("=" * 80)
-
-    if deleted_short_videos:
-        print(f"\nDELETED SHORT VIDEOS [{len(deleted_short_videos)}]")
-        for path, dur, sz in deleted_short_videos:
-            print(f"  {fmt_bytes(sz):>10}  ({dur})  {path}")
-
-    if bad_files:
-        corrupt_dir.mkdir(exist_ok=True)
-        print(f"\nCORRUPT / UNPLAYABLE [{len(bad_files)}]  ->  moving to {corrupt_dir}")
-        print("-" * 80)
-        for idx, (path, reason) in enumerate(bad_files):
-            try:
-                size_str = fmt_bytes(path.stat().st_size)
-            except Exception:
-                size_str = "N/A"
-            print(f"  {size_str:>10}  {path.name}")
-            print(f"              {reason[:200]}")
-            dest = corrupt_dir / path.name
-            if dest.exists():
-                dest = corrupt_dir / f"{path.stem}_{idx}{path.suffix}"
-            try:
-                shutil.move(str(path), str(dest))
-            except Exception as e:
-                print(f"              [MOVE ERROR] {e}")
-
-        report = root / "corrupt_files_report.txt"
-        with open(report, 'w', encoding='utf-8') as rf:
-            rf.write(f"Verification Report\nScanned: {root}\nQuarantine: {corrupt_dir}\n")
-            rf.write("=" * 80 + "\n\n")
-            if deleted_short_videos:
-                rf.write("DELETED SHORT VIDEOS\n")
-                for path, dur, sz in deleted_short_videos:
-                    rf.write(f"  [{dur}] {path}\n")
-                rf.write("\n")
-            rf.write("CORRUPT / UNPLAYABLE\n")
-            for path, reason in bad_files:
-                rf.write(f"  {path}\n  -> {reason}\n\n")
-        print(f"\nReport saved: {report}")
-    else:
-        print("\nAll files passed full decode verification.")
-        if deleted_short_videos:
-            report = root / "corrupt_files_report.txt"
-            with open(report, 'w', encoding='utf-8') as rf:
-                rf.write(f"Verification Report\nScanned: {root}\n\nDELETED SHORT VIDEOS\n")
-                for path, dur, sz in deleted_short_videos:
-                    rf.write(f"  [{dur}] {path}\n")
-            print(f"Deletion log saved: {report}")
-
-    if skipped:
-        print(f"\nSKIPPED [{len(skipped)}]")
-        for path, reason in skipped:
-            print(f"  {path.name}  ({reason})")
+    print("verifying %s" % root)
+    print("files: %d (%d symlinks skipped)   video workers: %d   fast workers: %d" % (
+        len(files), symlinks, video_workers, fast_workers))
+    print("mode: %s%s" % ("fast probe" if args.fast else "full decode",
+                          "   quarantine ON" if args.quarantine else ""))
     print()
+
+    display = ProgressDisplay(len(files), sum(safe_size(f) for f in files), video_workers,
+                              tty=(not args.no_progress) and sys.stdout.isatty())
+    stop_event = threading.Event()
+    ctx = {"root": root, "manifest": manifest, "events": events, "display": display,
+           "fast": args.fast, "quarantine": args.quarantine, "kinds": kinds,
+           "stop_event": stop_event}
+
+    videos = sorted((f for f in files if family_of(kinds[f]) == "video"),
+                    key=safe_size, reverse=True)
+    rest = [f for f in files if family_of(kinds[f]) != "video"]
+
+    video_pool = ThreadPoolExecutor(max_workers=video_workers, thread_name_prefix="vvideo")
+    fast_pool = ThreadPoolExecutor(max_workers=fast_workers, thread_name_prefix="vfast")
+    futures = {}
+    for f in videos:
+        futures[video_pool.submit(verify_file, f, ctx)] = f
+    for f in rest:
+        futures[fast_pool.submit(verify_file, f, ctx)] = f
+
+    display.redraw(force=True)
+    interrupted = False
+    try:
+        for fut in as_completed(futures):
+            exc = fut.exception()
+            if exc is not None:
+                with _lock:
+                    results.append({"verdict": "fail", "path": str(futures[fut]),
+                                    "note": "unhandled worker exception: %r" % exc,
+                                    "quarantined": None})
+                if display:
+                    display.advance(0, 0, True, "worker crash")
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_event.set()
+        for future in futures:
+            future.cancel()
+
+    if interrupted:
+        print("interrupt received; stopping active verification safely")
+    fast_pool.shutdown(wait=True, cancel_futures=interrupted)
+    video_pool.shutdown(wait=True, cancel_futures=interrupted)
+    display.finish()
+
+    counts = {}
+    for r in results:
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    quarantined = [r for r in results if r["quarantined"]]
+    fails = [r for r in results if r["verdict"] == "fail"]
+
+    print()
+    print("=" * 78)
+    print("VERIFICATION %s" % ("INTERRUPTED" if interrupted else "COMPLETE"))
+    print("=" * 78)
+    print("  files        : %d" % len(files))
+    print("  passed       : %d" % counts.get("ok", 0))
+    print("  failed       : %d" % counts.get("fail", 0))
+    print("  skipped      : %d" % counts.get("skip", 0))
+    print("  quarantined  : %d" % len(quarantined))
+    print("  elapsed      : %s" % fmt_seconds(time.time() - started))
+    print("=" * 78)
+
+    if fails:
+        print("\nFAILED [%d]" % len(fails))
+        for r in fails[:50]:
+            print("  %s" % r["path"])
+            print("      %s" % r["note"][:200])
+        if len(fails) > 50:
+            print("  ... and %d more in the JSON report" % (len(fails) - 50))
+    if fails and not args.quarantine:
+        print("\nnote: rerun with --quarantine to move failing files into %s (never deleted)" % QUARANTINE_DIR)
+        print("note: restore them any time with: python restore_files.py \"%s\"" % root)
+
+    report = {
+        "kind": "verify",
+        "root": str(root),
+        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "interrupted": interrupted,
+        "fast": args.fast,
+        "counts": counts,
+        "results": results,
+    }
+    report_path = root / STORE_DIR / ("verification-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        print("\nreport   : %s" % report_path)
+    except Exception as e:
+        print("\n[warn] could not write report: %s" % e)
+
+    manifest.record_run("verify", started, time.time(), {
+        "ok": counts.get("ok", 0), "fail": counts.get("fail", 0),
+        "skip": counts.get("skip", 0), "quarantined": len(quarantined)})
+    manifest.close()
+    events.log("run_end", kind="verify", interrupted=interrupted)
 
 
 if __name__ == "__main__":
