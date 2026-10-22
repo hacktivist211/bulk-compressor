@@ -18,12 +18,16 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
 
+from bc_common import (
+    detect_os, mp_context, mp_context_name, cpu_count, elevate_priority,
+)
+
 from term_progress import (
     ProgressDisplay, run_ffmpeg_progress, enable_ansi, fmt_bytes, fmt_seconds,
 )
 
-CPU = os.cpu_count() or 4
-GVFS = Path("/run/user/%d/gvfs" % os.getuid())
+CPU = cpu_count()
+GVFS = Path("/run/user/%d/gvfs" % (os.getuid() if hasattr(os, "getuid") else 0))
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache"))) / "phone-compress"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -819,6 +823,11 @@ def main():
         fatal("Pillow missing: conda install pillow")
 
     enable_ansi()
+    elevate_priority()
+    osname = detect_os()
+    if osname != "linux" and not args.mount_root:
+        fatal("automatic MTP mount discovery (GVFS/gio) only works on Linux; on %s pass "
+              "--mount-root DIR with the phone already mounted (or a synced folder)" % osname)
     mount, tdirs = resolve_targets(args.paths, args)
     serial = mount.name.split("host=", 1)[1] if "host=" in mount.name else mount.name
     safe_serial = re.sub(r"[^A-Za-z0-9._-]", "_", serial)
@@ -841,6 +850,7 @@ def main():
         print("target  : %s" % d.relative_to(mount))
     print("mode    : %s" % ("DRY RUN (phone untouched)" if args.dry_run else "IN-PLACE (originals replaced)"))
     print("video   : %s" % (("NVENC cq=%d" % args.cq) if C.gpu else ("libx265 crf=%d preset=%s" % (args.crf, args.preset))))
+    print("mp      : %s start method (%s, override with BULK_MP_METHOD)" % (mp_context_name(), osname))
     print("scanning...")
 
     paths, other = scan(tdirs)
@@ -884,7 +894,7 @@ def main():
                                 tty=(not args.no_progress) and sys.stdout.isatty())
 
     C.pix_pool = ProcessPoolExecutor(max_workers=image_workers,
-                                     mp_context=multiprocessing.get_context("spawn"))
+                                     mp_context=mp_context())
     C.pull_pool = ThreadPoolExecutor(max_workers=max(1, args.pull_workers), thread_name_prefix="pull")
     C.img_pool = ThreadPoolExecutor(max_workers=image_workers, thread_name_prefix="img")
     C.vid_pool = ThreadPoolExecutor(max_workers=video_workers, thread_name_prefix="vid")
