@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bc_common import (
-    STORE_DIR, QUARANTINE_DIR,
+    STORE_DIR, QUARANTINE_DIR, cpu_count, elevate_priority,
     fmt_seconds, which, safe_stat, safe_size, file_key,
     sniff_type, family_of, sweep_temp_files, scan_files, probe_video,
     zstd_backend, zstd_check, Manifest, EventLog, same_file_snapshot,
@@ -20,7 +20,7 @@ from term_progress import (
     ProgressDisplay, run_ffmpeg_progress, run_subprocess, enable_ansi,
 )
 
-CPU = os.cpu_count() or 4
+CPU = cpu_count()
 
 _lock = threading.Lock()
 results: list[dict[str, Any]] = []
@@ -200,6 +200,7 @@ def main():
         ap.error("--workers must be at least 1")
 
     enable_ansi()
+    elevate_priority()
     root = Path(args.directory).resolve()
     if not root.is_dir():
         print("Directory not found: %s" % root, file=sys.stderr)
