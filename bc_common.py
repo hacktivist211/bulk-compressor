@@ -1,7 +1,9 @@
 import hashlib
 import importlib
 import json
+import multiprocessing
 import os
+import platform
 import shutil
 import sqlite3
 import stat
@@ -11,6 +13,110 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform abstraction: OS detection, CPU count, multiprocessing policy,
+# process priority and per-OS performance tips. Every OS gets its fastest
+# safe configuration automatically; override with BULK_MP_METHOD=fork|spawn|
+# forkserver if you know better.
+# ---------------------------------------------------------------------------
+
+def detect_os():
+    """Return 'windows', 'macos', 'linux' or the lowercased platform name."""
+    name = platform.system().lower()
+    return {"windows": "windows", "darwin": "macos", "linux": "linux"}.get(
+        name, name or "unknown")
+
+
+def is_windows():
+    return detect_os() == "windows"
+
+
+def cpu_count():
+    """Usable logical CPU count: process_cpu_count (3.13+), then affinity."""
+    try:
+        n = os.process_cpu_count()  # Python 3.13+, respects cgroups/containers
+        if n:
+            return n
+    except AttributeError:
+        pass
+    try:
+        n = len(os.sched_getaffinity(0))  # Linux: respects taskset/cgroup
+        if n:
+            return n
+    except (AttributeError, OSError):
+        pass
+    return os.cpu_count() or 4
+
+
+def mp_context_name():
+    """Fastest safe multiprocessing start method for the current OS.
+
+    windows -> spawn   (only option; also required for CUDA/loaded DLLs)
+    macos   -> forkserver (fork is unsafe with the ObjC runtime and deprecated)
+    linux   -> fork    (near-zero worker startup cost, copy-on-write memory)
+    """
+    override = os.environ.get("BULK_MP_METHOD", "").strip().lower()
+    if override in ("fork", "spawn", "forkserver"):
+        return override
+    osname = detect_os()
+    if osname == "windows":
+        return "spawn"
+    if osname == "macos":
+        return "forkserver"
+    return "fork"
+
+
+def mp_context():
+    return multiprocessing.get_context(mp_context_name())
+
+
+def elevate_priority():
+    """Raise this process' scheduling priority where permitted.
+
+    Returns a short description for the run banner. Never raises.
+    """
+    try:
+        if is_windows():
+            import psutil  # optional; pip install psutil
+            psutil.Process(os.getpid()).nice(psutil.HIGH_PRIORITY_CLASS)
+            return "high (psutil)"
+    except Exception:
+        pass
+    if not is_windows() and hasattr(os, "nice"):
+        try:
+            os.nice(-5)  # needs privileges on most systems; harmless if denied
+            return "raised"
+        except OSError:
+            pass
+        except AttributeError:
+            pass
+    return "default"
+
+
+def os_tips(osname=None):
+    """Platform-specific throughput tips printed once at startup."""
+    name = osname or detect_os()
+    if name == "windows":
+        return [
+            "add the target folder to Windows Security > Virus & threat protection "
+            "> Exclusions (Defender real-time scanning can halve bulk I/O throughput)",
+            "for paths longer than 260 chars enable long paths: registry key "
+            "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem "
+            "LongPathsEnabled=1, or keep the tree under that limit",
+        ]
+    if name == "macos":
+        return [
+            "on Apple Silicon install tools natively (brew install sevenzip zstd "
+            "ffmpeg libjxl) instead of running x86_64 builds under Rosetta 2",
+            "grant Terminal/your IDE Full Disk Access for protected folders such "
+            "as ~/Documents, ~/Desktop and external volumes",
+        ]
+    return [
+        "for the fastest image pool, Linux uses fork-based workers; override with "
+        "BULK_MP_METHOD=spawn if workers touch threads/CUDA",
+    ]
 
 TMP_PREFIX = ".bctmp_"
 STORE_DIR = ".bulk_compressor"
