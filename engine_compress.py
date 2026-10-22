@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bc_common import (
-    STORE_DIR,
+    STORE_DIR, cpu_count, detect_os, elevate_priority, os_tips,
     fmt_bytes, fmt_seconds, which, safe_stat, safe_size, file_key, hash_file,
     sniff_type, family_of, family_of_ext, make_tmp, sweep_temp_files, scan_files,
     atomic_replace, preserve_stat, same_file_snapshot, zstd_backend,
@@ -27,7 +27,7 @@ from term_progress import (
     ProgressDisplay, run_ffmpeg_progress, run_subprocess, enable_ansi,
 )
 
-CPU = os.cpu_count() or 4
+CPU = cpu_count()
 CFG: dict[str, Any] = {}
 
 DEFAULTS = {
@@ -966,6 +966,8 @@ def main():
     ap.add_argument("--cpu-video", action="store_true", default=None,
                     help="disable NVENC, use software encoding")
     ap.add_argument("--video-workers", type=int, default=None)
+    ap.add_argument("--workers", type=int, default=None,
+                    help="fast-pool worker threads (default: cpu count minus video workers)")
     ap.add_argument("--jpeg-quality", type=int, default=None)
     ap.add_argument("--avif", action="store_true", default=None,
                     help="convert JPEG/PNG/BMP/TIFF to AVIF")
@@ -991,6 +993,7 @@ def main():
     args = ap.parse_args()
 
     enable_ansi()
+    priority = elevate_priority()
     root = Path(args.directory).resolve()
     if not root.is_dir():
         fatal("Directory not found: %s" % root)
@@ -1016,6 +1019,8 @@ def main():
     vals = resolve_settings(args, config)
     if args.limit is not None and args.limit < 1:
         fatal("--limit must be at least 1")
+    if args.workers is not None and args.workers < 1:
+        fatal("--workers must be at least 1")
 
     if args.save_config:
         target = Path(args.config) if args.config else (Path(__file__).resolve().parent / "config.json")
@@ -1151,7 +1156,7 @@ def main():
         encoder_desc = "libx264 crf %d preset %s" % (vals["x264_crf"], vals["preset"])
 
     video_workers = vals["video_workers"] or (3 if gpu else max(1, min(2, CPU // 3)))
-    fast_workers = max(2, CPU - video_workers)
+    fast_workers = args.workers or max(2, CPU - video_workers)
     zname = zstd_backend()[0] or "none"
     if vals["vmaf_samples"] > 0:
         gate_desc = "VMAF %d sample%s at %.1f" % (vals["vmaf_samples"],
@@ -1162,6 +1167,8 @@ def main():
 
     print("config             : %s" % (config_path_used if config_path_used
                                        else "none (defaults; use --save-config to persist)"))
+    print("platform           : %s (%d logical cpus, io priority %s)"
+          % (detect_os(), CPU, priority))
     print("files discovered   : %d (%d symlinks skipped)" % (len(files), symlink_count))
     print("duplicates skipped : %d" % len(dupes))
     print("to process         : %d (%s)" % (len(pending), fmt_bytes(total_bytes)))
@@ -1180,6 +1187,8 @@ def main():
         print("tip                : set codec to av1 in the config for higher compression at equal quality")
     if vals["backup"] is None:
         print("tip                : set backup in the config (or --backup DIR) to enable one-command rollback")
+    for _tip in os_tips():
+        print("tip                : %s" % _tip)
     print("policy             : short 1-3s clips are never deleted; originals only replaced when smaller")
     print()
 
