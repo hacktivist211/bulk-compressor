@@ -488,7 +488,7 @@ flowchart TD
     E -- yes --> F[Hash orig* and src against journal hashes]
     F --> G{src hash == old_sha256?}
     G -- yes --> H{dest exists and hashes to new_sha256?}
-    G -- no --> I{dest hash == new_sha256 and (dest==src or src gone)?}
+    G -- no --> I{"dest hash == new_sha256 and (dest==src or src gone)?"}
     I -- yes --> J[Verified completed push<br/>remove job dir]
     I -- no --> K{old_sha256 in journal?}
     K -- no --> P3[Keep job dir<br/>cannot prove integrity]
