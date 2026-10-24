@@ -1,0 +1,29 @@
+Bulk Compressor remediation notes
+
+Implemented safety and reliability changes
+- Reject replacement if the input file's device, inode, size, or nanosecond modification time changes during compression.
+- Create and hash-check backups before replacement; preserve file timestamps and modes during replacement and rollback.
+- Persist backup hashes in the manifest while migrating existing manifest databases without deleting their records.
+- Refuse rollback when the backup size or recorded hash does not match.
+- Prevent parallel jobs from replacing the same output path.
+- Make subprocess operations explicitly non-checking where return codes are intentionally handled, and add cooperative interruption for active subprocess work.
+- Avoid quarantining files changed while verification is in progress.
+- Harden phone-transfer recovery to use content hashes and preserve unverifiable recovery data, including staged originals whose journal was not yet written.
+- Validate key numeric settings and target paths; avoid disabling Pillow's decompression-bomb protection.
+- Add regression tests for replacement, backup/rollback, recovery, cancellation, manifest migration, target collisions, and verification safety.
+
+Validation performed in the supplied execution environment
+- Python compileall passed.
+- All four CLI --help smoke tests passed.
+- 17 pytest regression tests passed.
+- A real JPEG compression -> verification -> rollback workflow passed; the original image was restored and decoded successfully.
+- Measured coverage with the regression suite: 22% overall. The test suite is intentionally focused on critical regressions, not exhaustive behavior coverage.
+
+Static-analysis limitation
+- The supplied reports came from an earlier run. Ruff, mypy, Bandit, Pylint, Flake8, Xenon, and pip-audit were not installed in the active execution environment; installing them was unavailable because package-index network access failed. This bundle does not claim a fresh clean run of those analyzers.
+- The explicit mypy findings in the supplied report were addressed with typed globals/results and a dynamic optional import for blake3. The full pre-existing style/complexity backlog (for example percent-format warnings, line length, broad exception handling, and complex entry-point functions) has not been mass-rewritten because broad automated refactoring without the analyzers and complete checks would risk changing established behavior.
+
+Dependency-audit scope
+- requirements.txt sets Pillow>=13.0.0, the supplied pip-audit report's stated fix level for the Pillow findings.
+- The supplied audit also flagged chromadb, mcp, pypdf, and PyPDF2 in the surrounding installed environment. They are not direct imports of the six Bulk Compressor scripts and were not added as runtime dependencies here. Update them in the specific application environment that requires them, using the fix versions listed in the report and compatibility-tested pins. The report did not state usable fix versions for the chromadb findings.
+- pip-audit skipped several Conda-managed packages because they were not available to its PyPI advisory lookup. Those findings cannot be resolved by changes to these Python scripts.
